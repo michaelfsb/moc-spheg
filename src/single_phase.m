@@ -3,20 +3,24 @@
 import casadi.*
 
 clearvars
-load("inputs\data.mat")
+
+addpath('inputs')
 addpath('models')
+addpath('interpolation')
+load("data.mat")
 
 %% Problem constants
 
 Tf = 1440;   % Final time (min)
-N = 42;      % Number of control intervals
+N = 14*3;      % Number of control intervals
 
 M_0 = 164;     % Initial volume of hydrogen (g)
 M_min = 49.2;  % Minimum volume of hydrogen (g)
 M_max = 205;   % Maximum volume of hydrogen (g)
 I_e_0 = 30;    % Initial current (A)
-I_e_min = 30;  % Minimum current (A)
+I_e_min = 20;  % Minimum current (A)
 I_e_max = 100; % Maximum current (A)
+I_e_N = 10;    % Stadby current (A)
 
 %% Problblem variables
 
@@ -48,7 +52,7 @@ f = casadi.Function('f', ...
     {'x', 'u', 't'}, {'x_dot', 'L'});
 
 %% Create the NPL
-
+tic
 % Time grid
 h = Tf/N;
 nGrid = 2*N-1;
@@ -90,12 +94,11 @@ ubx(1) = M_0;
 xGuess = (M_max - M_min)/2;
 uGuess = (I_e_max - I_e_min)/2;
 x0 = [xGuess*ones(length(X),1) ; uGuess*ones(length(U),1)];
-
+toc
 %% Solve
 
 nlp = struct('x', x, 'f', L, 'g', g);
 solver = nlpsol('solver', 'ipopt', nlp);
-
 solution = solver('x0', x0, 'lbx', lbx, 'ubx', ubx,...
     'lbg', lbg, 'ubg', ubg);
 
@@ -108,46 +111,78 @@ t_opt = linspace(0,1440, length(u_opt));
 
 %% Simulate solution
 
-nOpt = length(u_opt);
-f_h2_prd_opt =  zeros(nOpt,1);
-v_el_opt =  zeros(nOpt,1);
-p_el_opt =  zeros(nOpt,1);
-p_ps_opt = zeros(nOpt,1);
-i_ps_opt = zeros(nOpt,1);
-for i=1:nOpt
-    [f_h2_prd_opt(i), v_el_opt(i), p_el_opt(i)] = electrolyzer_model(u_opt(i));
-    [i_ps_opt(i), ~, p_ps_opt(i)] = photovoltaic_model(full(Irradiation(t_opt(i))));
+f_opt = full(f(x_opt,u_opt,t_opt'));
+
+t_inter = 0:10:1440;
+u_inter = interp_ctr(t_opt, u_opt', t_inter);
+x_inter = interp_std(t_opt, x_opt', f_opt', t_inter);
+
+nInter = length(t_inter);
+f_h2_prd_opt =  zeros(nInter,1);
+v_el_opt =  zeros(nInter,1);
+p_el_opt =  zeros(nInter,1);
+p_ps_opt = zeros(nInter,1);
+p_grid = zeros(nInter,1);
+p_grid2 = zeros(nInter,1);
+for i=1:nInter
+    [f_h2_prd_opt(i), v_el_opt(i), p_el_opt(i)] = electrolyzer_model(u_inter(i));
+    [~, ~, p_ps_opt(i)] = photovoltaic_model(full(Irradiation(t_inter(i))));
+    if p_el_opt(i) > p_ps_opt(i) - 1
+      p_grid(i) = p_el_opt(i) -  p_ps_opt(i);
+    else
+      p_grid2(i) = p_ps_opt(i) - p_el_opt(i);
+    end
+    
 end
 
-fprintf('\nCost: %f W^2\n',full(solution.f))
-fprintf('Grid energy: %4.2f W\n',sqrt(full(solution.f)))
+e_grid = trapz(t_inter/60, p_grid)/1000;
+e_grid2 = trapz(t_inter/60, p_grid2)/1000;
+e_el = trapz(t_inter/60,p_el_opt)/1000;
+h2_prd = trapz(t_inter, f_h2_prd_opt);
+
+fprintf('\n\nCosumed grid energy: %4.2f kWh\n', e_grid)
+fprintf('Absorbed grid energy: %4.2f kWh\n', e_grid2)
+fprintf('Electrolyzer energy: %4.2f kWh\n', e_el)
+fprintf('Prod H2: %4.2f g\n', h2_prd)
+fprintf('Final H2: %4.2f %\n', 100*x_inter(end)/M_max)
 
 %% Plots
 
 figure()
-subplot(3,1,1);
-plot(t_opt/60, p_el_opt, 'LineWidth', 1.5, 'Color', '#0152a1')
+subplot(4,1,1);
 hold on
 grid on
-plot(t_opt/60, p_ps_opt, 'LineWidth', 1.5, 'Color', '#ff8700')
-legend('P_E','P_S')
-ylabel('Power [W]')
+plot(t_inter/60, p_ps_opt/1000, 'LineWidth', 1.5, 'Color', '#ff8700')
+plot(t_inter/60, p_el_opt/1000, 'LineWidth', 1.5, 'Color', '#0152a1')
+legend('P_S','P_E')
+ylabel('Power [kW]')
 xticks([0 2 4 6 8 10 12 14 16 18 20 22 24])
 
-subplot(3,1,2);
-plot(t_opt/60, f_h2_prd_opt, 'LineWidth', 1.5, 'Color', '#0152a1')
+subplot(4,1,2);
 hold on
 grid on
 plot((0:1:1440)/60,full(HydrogenDemand(0:1:1440)), 'LineWidth', 1.5, 'Color', '#e40613')
-legend('f_{H_2}','f_{H_2}^{dm}')
+plot(t_inter/60, f_h2_prd_opt, 'LineWidth', 1.5, 'Color', '#0152a1')
+legend('f_{H_2}^{dm}','f_{H_2}')
 ylabel('H_2 [g/min]')
+yticks([0 .25 .5])
 xticks([0 2 4 6 8 10 12 14 16 18 20 22 24])
 
-subplot(3,1,3);
-plot(t_opt/60, 100*x_opt/M_max, 'LineWidth', 1.5, 'Color', '#32a202')
+subplot(4,1,3);
+plot(t_inter/60, 100*x_inter/M_max, 'LineWidth', 1.5, 'Color', '#32a202')
 hold on
 grid on
 legend('m_{H_2}')
 ylabel('H_2 [%]')
+xticks([0 2 4 6 8 10 12 14 16 18 20 22 24])
+
+subplot(4,1,4);
+hold on
+grid on
+plot(t_inter/60, u_inter, 'LineWidth', 1.5, 'Color', '#0152a1')
+y1 = yline(I_e_min, '--','i_{E}^{min}','LineWidth',2);
+y1.LabelHorizontalAlignment = 'center';
+legend('i_{E}')
+ylabel('Current [A]')
 xticks([0 2 4 6 8 10 12 14 16 18 20 22 24])
 xlabel('Time [h]')
